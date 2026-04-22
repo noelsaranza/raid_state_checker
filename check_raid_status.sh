@@ -11,88 +11,89 @@ STATE_UNKNOWN=3
 
 if [ "$TEST_MODE" == "1" ]; then
     MDSTAT="/tmp/mdstat"
-    MDADM_INFO_FILE="/tmp/mdadm_detail"
 else
     MDSTAT="/proc/mdstat"
 fi
 
 ############################################
-# DETECT RAID DEVICE
+# VALIDATE INPUT FILE
 ############################################
 
-MD_NAME=$(grep -oE '^md[0-9]+' "$MDSTAT" | head -n1)
+if [ ! -f "$MDSTAT" ]; then
+    echo "UNKNOWN - Cannot access $MDSTAT"
+    exit $STATE_UNKNOWN
+fi
 
-if [ -z "$MD_NAME" ]; then
+############################################
+# DETECT RAID DEVICE(S)
+############################################
+
+MD_LIST=$(awk '/^md[0-9]+/ {print $1}' "$MDSTAT")
+
+if [ -z "$MD_LIST" ]; then
     echo "UNKNOWN - No RAID device found"
     exit $STATE_UNKNOWN
 fi
 
-MD_DEVICE="/dev/$MD_NAME"
-
 ############################################
-# GET RAID DETAILS
+# INITIAL STATUS FLAGS
 ############################################
 
-if [ "$TEST_MODE" == "1" ]; then
-    LD_INFO=$(cat "$MDADM_INFO_FILE")
-else
-    LD_INFO=$(mdadm --detail "$MD_DEVICE" 2>/dev/null)
-fi
-
-if [ -z "$LD_INFO" ]; then
-    echo "UNKNOWN - Cannot read RAID details"
-    exit $STATE_UNKNOWN
-fi
+CRITICAL_FLAG=0
+WARNING_FLAG=0
+OUTPUT_MSG=""
 
 ############################################
-# PARSE STATUS
+# LOOP THROUGH ALL MD DEVICES
 ############################################
 
-LD_STATUS=$(echo "$LD_INFO" | awk -F: '/State|status/ {gsub(/^ +| +$/,"",$2); print $2}' | head -n1)
+for MD_NAME in $MD_LIST; do
+
+    MD_DEVICE="/dev/$MD_NAME"
+
+    RAID_LINE=$(grep -E "^$MD_NAME" "$MDSTAT")
+
+    STATUS=$(echo "$RAID_LINE" | grep -o "\[.*\]" | tail -n1)
+
+    # Detect degraded arrays
+    if echo "$STATUS" | grep -q "\[_\]"; then
+        WARNING_FLAG=1
+        OUTPUT_MSG+="WARNING - $MD_NAME is degraded; "
+    fi
+
+    # Detect failed arrays
+    if echo "$STATUS" | grep -q "\[__\]"; then
+        CRITICAL_FLAG=1
+        OUTPUT_MSG+="CRITICAL - $MD_NAME is broken; "
+    fi
+
+    # Detect rebuilding
+    if echo "$RAID_LINE" | grep -qi "rebuild\|recovery"; then
+        REBUILD_PCT=$(echo "$RAID_LINE" | grep -oE '[0-9]+' | head -n1)
+        WARNING_FLAG=1
+        OUTPUT_MSG+="REBUILDING $MD_NAME (${REBUILD_PCT}%) ; "
+    fi
+
+    # Healthy state
+    if [ "$CRITICAL_FLAG" -eq 0 ] && [ "$WARNING_FLAG" -eq 0 ]; then
+        OUTPUT_MSG+="OK - $MD_NAME healthy; "
+    fi
+
+done
 
 ############################################
-# DETECT FAILED DISKS
+# FINAL DECISION ENGINE
 ############################################
 
-FAILED_DISKS=$(echo "$LD_INFO" | awk '
-/faulty|removed|failed|Missing/ {
-    print $NF
-}
-' | paste -sd "," -)
-
-############################################
-# DETECT REBUILD
-############################################
-
-REBUILDING=$(echo "$LD_INFO" | grep -i "rebuild\|recovery")
-REBUILD_PCT=$(echo "$REBUILDING" | grep -oE '[0-9]+' | head -n1)
-
-############################################
-# DETECT DEGRADED STATE FROM MDSTAT
-############################################
-
-DEGRADED=$(grep -E "\[U_\]|\[_U\]|\[__\]" "$MDSTAT")
-
-############################################
-# LOGIC ENGINE
-############################################
-
-# CRITICAL: failed disks or fully broken RAID
-if [ -n "$FAILED_DISKS" ] || echo "$DEGRADED" | grep -q "\[__\]"; then
-    echo "CRITICAL - RAID failure on $MD_DEVICE - failed_disks=${FAILED_DISKS:-none}"
+if [ "$CRITICAL_FLAG" -eq 1 ]; then
+    echo "CRITICAL - RAID failure detected | $OUTPUT_MSG"
     exit $STATE_CRITICAL
 fi
 
-# WARNING: rebuilding or degraded
-if [ -n "$REBUILDING" ] || [ -n "$DEGRADED" ]; then
-    if [ -n "$REBUILD_PCT" ]; then
-        echo "WARNING - RAID rebuilding (${REBUILD_PCT}%) on $MD_DEVICE"
-    else
-        echo "WARNING - RAID degraded on $MD_DEVICE"
-    fi
+if [ "$WARNING_FLAG" -eq 1 ]; then
+    echo "WARNING - RAID degraded or rebuilding | $OUTPUT_MSG"
     exit $STATE_WARNING
 fi
 
-# OK
-echo "OK - RAID healthy on $MD_DEVICE (${LD_STATUS:-unknown})"
+echo "OK - All RAID arrays healthy | $OUTPUT_MSG"
 exit $STATE_OK
